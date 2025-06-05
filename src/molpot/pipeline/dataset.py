@@ -57,7 +57,7 @@ class Dataset(torch.utils.data.Dataset):
             ds.add_process(AtomicDescriptor(cutoff=5.0))
             ds.add_process(CalcNeighborList(r=6.0))
         """
-        self.processes.append(proc)
+        self.processes.add(proc)
 
     def prepare(self) -> int:
         """

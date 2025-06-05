@@ -1,185 +1,135 @@
-from functools import reduce
-from typing import Iterator, Sequence
+import io
+import tarfile
+import time
+from pathlib import Path
 
+import numpy as np
+import requests
 import torch
-import torchdata.nodes as tn
-from torch.utils.data import (Dataset, RandomSampler, SequentialSampler,
-                              default_collate)
+from torch.nn import Sequential
+from tqdm import tqdm
 
-from molpot import Config, Frame, alias
+import molpot as mpot
+from molpot import alias
+from collections import defaultdict
+import h5py
 
-config = Config()
+logger = mpot.get_logger("molpot.dataset")
+config = mpot.get_config()
 
-def compose(*funcs):
-    """Compose a list of functions into a single function."""
-    return lambda x: reduce(lambda v, f: f(v), funcs, x)
+class QDpi:
 
-
-def cancel_batch(tensor_or_nested_tensor: torch.Tensor):
-    if isinstance(tensor_or_nested_tensor, torch.Tensor):
-        if tensor_or_nested_tensor.is_nested:
-            return torch.concat(tensor_or_nested_tensor.unbind())
-        else:
-            return tensor_or_nested_tensor.reshape(
-                -1, *tensor_or_nested_tensor.shape[2:]
-            )
-    return tensor_or_nested_tensor.apply(
-        cancel_batch, batch_size=[], call_on_nested=True
-    )
-
-
-def _compact_collate(batch: Sequence[Frame]):
-    """collate a batch of frames into a single frame, with batch masks and offsets. no nested tensors.
-
-    Args:
-        batch (Sequence[Frame]): _description_
-
-    Returns:
-        _type_: _description_
-    """
-    print(f"[DEBUG] Collating batch of size {len(batch)}")
-    print(f"[DEBUG] First frame keys: {list(batch[0].keys())}")
-    
-    # Debug alias values
-    print(f"[DEBUG] alias.pair_i = {alias.pair_i}")
-    print(f"[DEBUG] alias.pair_j = {alias.pair_j}")
-    print(f"[DEBUG] alias.pair_diff = {alias.pair_diff}")
-    print(f"[DEBUG] alias.Z = {alias.Z}")
-    print(f"[DEBUG] alias.R = {alias.R}")
-    
-    coll_batch = Frame.maybe_dense_stack(batch).densify()
-    print(f"[DEBUG] Stacked batch keys: {list(coll_batch.keys())}")
-    # batch_size = int(coll_batch.batch_size.numel())
-
-    if alias.n_atoms not in coll_batch:
-        n_atoms = torch.tensor(
-            [len(frame[alias.R]) for frame in batch], dtype=config.itype
-        )
-    else:
-        n_atoms = coll_batch[alias.n_atoms]
-
-    atom_batch = torch.cat(
-        [torch.full((t,), fill_value=i) for i, t in enumerate(n_atoms)]
-    ).to(config.itype)
-
-    atom_offset = torch.zeros(len(n_atoms), dtype=config.itype)
-    torch.cumsum(torch.flatten(n_atoms)[:-1], dim=0, out=atom_offset[1:]).to(
-        config.itype
-    )
-
-    coll_frame = coll_batch.apply(cancel_batch, batch_size=[])
-    coll_frame[alias.atom_batch] = atom_batch
-    coll_frame[alias.atom_offset] = atom_offset
-
-    # Fix: Check if pair_i exists instead of pairs namespace
-    print(f"[DEBUG] Checking for pair_i key: {alias.pair_i} in coll_batch")
-    print(f"[DEBUG] pair_i exists: {alias.pair_i in coll_batch}")
-    
-    # Check what pairs keys actually exist
-    pairs_keys = [k for k in coll_batch.keys() if isinstance(k, tuple) and len(k) >= 2 and k[0] == "pairs"]
-    print(f"[DEBUG] Available pairs keys: {pairs_keys}")
-    
-    if alias.pair_i in coll_batch:
-        print(f"[DEBUG] Processing pairs data")
-        n_pairs = torch.tensor(
-            [len(frame[alias.pair_i]) for frame in batch], dtype=config.itype
-        )
-        pair_batch = torch.cat(
-            [
-                torch.full((t,), fill_value=i)
-                for i, t in enumerate([len(frame[alias.pair_i]) for frame in batch])
-            ]
-        )
-        pair_offset = torch.zeros(len(n_pairs), dtype=config.itype)
-        torch.cumsum(torch.flatten(n_pairs)[:-1], dim=0, out=pair_offset[1:]).to(
-            config.itype
-        )
-        print(f"[DEBUG] atom_offset: {atom_offset}")
-        print(f"[DEBUG] pair_batch: {pair_batch}")
-        coll_frame[alias.pair_i] = (
-            torch.concat(coll_batch[alias.pair_i].unbind()) + atom_offset[pair_batch]
-        )
-        coll_frame[alias.pair_j] = (
-            torch.concat(coll_batch[alias.pair_j].unbind()) + atom_offset[pair_batch]
-        )
-        coll_frame[alias.pair_batch] = pair_batch
-        coll_frame[alias.pair_offset] = pair_offset
-    else:
-        print(f"[DEBUG] No pairs data found")
-
-    print(f"[DEBUG] Final collated frame keys: {list(coll_frame.keys())}")
-    return coll_frame
-
-
-# def _nested_collate(batch: Sequence[Frame]):
-#     return Frame.from_frames(batch).densify()
-
-
-class MapAndCollate:
-    """A simple transform that takes a batch of indices, maps with dataset, and then applies
-    collate.
-    TODO: make this a standard utility in torchdata.nodes
-    """
-
-    def __init__(self, dataset, collate_fn):
-        self.dataset = dataset
-        self.collate_fn = collate_fn
-
-    def __call__(self, batch_of_indices: list[int]):
-        batch = [self.dataset[i] for i in batch_of_indices]
-        return self.collate_fn(batch)
-
-
-class DataLoader(tn.Loader):
+    urls = {
+        "charged": {
+            "re_charged": "charged/re_charged.hdf5",
+            "remd_charged": "charged/remd_charged.hdf5",
+            "spice_charged": "charged/spice_charged.hdf5",
+        },
+        "neutral": {
+            "ani": "neutral/ani.hdf5",
+            "comp6": "neutral/comp6.hdf5",
+            "freesolvmd": "neutral/freesolvmd.hdf5",
+            "geom": "neutral/geom.hdf5",
+            "re": "neutral/re.hdf5",
+            "remd": "neutral/remd.hdf5",
+            "spice": "neutral/spice.hdf5",
+        }
+    }
 
     def __init__(
         self,
-        dataset: Dataset | Iterator[Frame],
-        batch_size: int = 1,
-        shuffle: bool = True,
-        num_workers: int = 0,
-        pin_memory: bool = False,
-        drop_last: bool = False,
-        collate_fn=_compact_collate,
+        save_dir: Path | None = None,
+        device: str = "cpu",
+        subset: str|list[str] = "all",
     ):
+        from .dataset import MapStyleDataset
+        
+        self.name = "QDpi"
+        self.save_dir = save_dir
+        self.device = device
+        self.subset = subset
+        
+        self._frames = []
 
-        # Start with a sampler, since caller did not provide one
-        sampler = RandomSampler(dataset, generator=config.get_generator()) if shuffle else SequentialSampler(dataset)
-        # Sampler wrapper converts a Sampler to a BaseNode
-        node = tn.SamplerWrapper(sampler)
+        if not issubclass(self.__class__, MapStyleDataset):
+            self.__class__ = type('QDpi', (self.__class__, MapStyleDataset), {})
+            MapStyleDataset.__init__(self, self.name, save_dir=self.save_dir, device=self.device)
+        
+        
 
-        # Now let's batch sampler indices together
-        node = tn.Batcher(node, batch_size=batch_size, drop_last=drop_last)
 
-        # Create a Map Function that accepts a list of indices, applies getitem to it, and
-        # then collates them
-        map_and_collate = MapAndCollate(dataset, collate_fn or default_collate)
+    def __len__(self):
+        return len(self._frames)
 
-        # MapAndCollate is doing most of the heavy lifting, so let's parallelize it. We could
-        # choose process or thread workers. Note that if you're not using Free-Threaded
-        # Python (eg 3.13t) with -Xgil=0, then multi-threading might result in GIL contention,
-        # and slow down training.
-        if num_workers > 1:
-            node = tn.ParallelMapper(
-                node,
-                map_fn=map_and_collate,
-                num_workers=num_workers,
-                method="process",  # Set this to "thread" for multi-threading
-                in_order=True,
-            )
-            prefetch_factor = num_workers * 2
-        else:
-            node = tn.Mapper(node, map_fn=map_and_collate)
-            prefetch_factor = 1
+    def __getitem__(self, idx):
+        return self._frames[idx]
+    
+    def get_subset_data(self):
+        if self.subset == "all":
+            return self.urls
 
-        # Optionally apply pin-memory, and we usually do some pre-fetching
-        if pin_memory:
-            node = tn.PinMemory(node)
-        node = tn.Prefetcher(node, prefetch_factor=prefetch_factor)
+        ds = defaultdict(dict)
+        missing = []
 
-        # Note that node is an iterator, and once it's exhausted, you'll need to call .reset()
-        # on it to start a new Epoch.
-        # Insteaad, we wrap the node in a Loader, which is an iterable and handles reset. It
-        # also provides state_dict and load_state_dict methods.
+        def add_entry(key: str):
+            for category in self.urls:
+                if key in self.urls[category]:
+                    ds[category][key] = self.urls[category][key]
+                    return True
+            return False
 
-        super().__init__(node)
+        if isinstance(self.subset, str):
+            if not add_entry(self.subset):
+                missing.append(self.subset)
+        elif isinstance(self.subset, list):
+            for key in self.subset:
+                if not add_entry(key):
+                    missing.append(key)
+
+        if missing:
+            print(f"[Warning] The following entries were not found: {missing}")
+
+        return dict(ds)
+
+    def prepare(self):
+        logger.info("prepaering QDpi dataset...")
+
+        ds = self.get_subset_data()
+
+        for category, subds in ds.items():
+            for key, url in subds.items():
+                self._download(url, key)
+        
+        return self._frames
+
+    def _download(self, url: str, key: str):
+        gitlab_root = "https://gitlab.com/RutgersLBSR/QDpiDataset/-/raw/main/data/"
+        qdpi_hdf5 = f"{self.save_dir}/{key}.hdf5"
+        with requests.get(gitlab_root+url, stream=True) as response:
+            response.raise_for_status()
+            with open(qdpi_hdf5, "wb") as file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    file.write(chunk)
+
+        with h5py.File(qdpi_hdf5, 'r') as f:
+            
+            for name, mol in f.items():
+                pbc = not bool(mol["nopbc"])
+                coord = torch.tensor(mol["set.000"]["coord.npy"]).reshape(-1, 3)
+                energy = torch.tensor(mol["set.000"]["energy.npy"])  # (1, 1)
+                force = torch.tensor(mol["set.000"]["force.npy"]).reshape(-1, 3)
+                net_charge = torch.tensor(mol["set.000"]["net_charge.npy"])  # (1, 1)
+                type_raw = torch.tensor(mol["type.raw"])
+                type_map = torch.tensor(mol["type.map"])
+                type_name = mpot.Element.get_atomic_number(type_map[type_raw])
+
+                frame = mpot.Frame()
+                frame[alias.R] = coord
+                frame[alias.F] = force
+                frame[alias.E] = energy
+                frame[alias.Q] = net_charge
+                frame[alias.Z] = type_name
+
+                self._frames.append(frame)
+
+        return self._frames

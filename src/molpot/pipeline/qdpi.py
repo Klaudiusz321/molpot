@@ -53,45 +53,17 @@ class QDpi:
         self.save_dir = save_dir
         self.device = device
         self.subset = subset
-        self._frames: list[mpot.Frame] = []
+        self._frames: list[mpot.frames] = []
         self._prepared = False
 
-        # Fix: Inherit from MapStyleDataset properly but don't auto-prepare
         if not issubclass(self.__class__, MapStyleDataset):
             self.__class__ = type("QDpi", (self.__class__, MapStyleDataset), {})
-            # Initialize parent class components without calling prepare()
-            self.labels = mpot.NameSpace(self.name)
-            
-            if save_dir is None:
-                from tempfile import TemporaryDirectory
-                self._tmpdir = TemporaryDirectory(suffix=f"_{self.name}")
-                self.save_dir = Path(self._tmpdir.name)
-            else:
-                self.save_dir = Path(save_dir)
-                self.save_dir.mkdir(parents=True, exist_ok=True)
-            
-            from .process.base import ProcessManager
-            self.processes = ProcessManager()
-            # Don't call prepare() automatically - let user control when it happens
+            MapStyleDataset.__init__(self, self.name, save_dir=self.save_dir, device=self.device)
 
     def __len__(self):
-        if not self._prepared:
-            # Call prepare if not already done
-            self.prepare()
         return len(self._frames)
 
     def __getitem__(self, idx):
-        if not self._prepared:
-            # Call prepare if not already done
-            self.prepare()
-        # Apply processes (like NeighborList) to the frame
-        frame = self._frames[idx]
-        return self.processes.process_one(frame)
-
-    def get_frame(self, idx):
-        """Get raw frame without processing (required by Dataset interface)"""
-        if not self._prepared:
-            self.prepare()
         return self._frames[idx]
 
     def get_subset_data(self):
@@ -167,22 +139,12 @@ class QDpi:
                     if req_key not in mol:
                         raise RuntimeError
                 coord = torch.tensor(np.array(mol["set.000"]["coord.npy"])).reshape(-1, 3)
-                energy_data = np.array(mol["set.000"]["energy.npy"])
-                # Ensure energy is a scalar
-                if energy_data.ndim > 0:
-                    energy = torch.tensor(float(energy_data.flat[0]))
-                else:
-                    energy = torch.tensor(float(energy_data))
+                energy = torch.tensor(np.array(mol["set.000"]["energy.npy"]))
                 force = torch.tensor(np.array(mol["set.000"]["force.npy"])).reshape(-1, 3)
                 
                 # Check if net_charge exists, use default value if not
                 if "net_charge.npy" in mol["set.000"]:
-                    net_charge_data = np.array(mol["set.000"]["net_charge.npy"])
-                    # Ensure it's a scalar by taking the first element if it's an array
-                    if net_charge_data.ndim > 0:
-                        net_charge = torch.tensor(float(net_charge_data.flat[0]))
-                    else:
-                        net_charge = torch.tensor(float(net_charge_data))
+                    net_charge = torch.tensor(np.array(mol["set.000"]["net_charge.npy"]))
                 else:
                     # Default to neutral charge if not specified
                     net_charge = torch.tensor(0.0)

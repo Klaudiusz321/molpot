@@ -4,26 +4,18 @@ import torch
 
 def main(max_steps: int = 10000):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Set device in molpot config
-    config = mpot.get_config()
-    config.device = device
 
     # Load QDpi dataset and prepare neighbor lists
     qdpi = mpot.dataset.QDpi(save_dir="data/qdpi", device=device)
     qdpi.add_process(mpot.process.NeighborList(cutoff=5.0))
-    
-    # Explicitly prepare the dataset
-    qdpi.prepare()
 
-    # Use smaller subset for testing - reduce from 10000 to 100
-    subset = torch.utils.data.Subset(qdpi, range(100))
+    subset = torch.utils.data.Subset(qdpi, range(10000))
     train_size = int(0.8 * len(subset))
     val_size = len(subset) - train_size
     train_ds, val_ds = torch.utils.data.random_split(subset, [train_size, val_size])
 
-    train_dl = mpot.DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=0)
-    val_dl = mpot.DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=0)
+    train_dl = mpot.DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4)
+    val_dl = mpot.DataLoader(val_ds, batch_size=32, shuffle=False, num_workers=4)
 
     # Build PiNet2 based potential
     pinet = mpot.potential.nnp.PiNet2(
@@ -35,16 +27,16 @@ def main(max_steps: int = 10000):
         pp_nodes=[64, 64, 64, 64],
         activation=torch.nn.Tanh(),
     )
-    e_readout = mpot.potential.nnp.readout.Batchwise(
+    e_readout = mpot.potential.nnp.readout.Atomwise(
         n_neurons=[64, 64, 1],
-        in_key=("pinet", "p1"),
-        out_key=("predicts", "energy"),
+        in_keys=[("pinet", "p1")],
+        out_keys=[("predicts", "energy")],
         reduce="sum",
     )
     f_readout = mpot.potential.nnp.readout.PairForce(
-        in_key=("predicts", "energy"),
+        in_keys=("predicts", "energy"),
         dx_key=mpot.alias.pair_diff,
-        out_key=("predicts", "forces"),
+        out_keys=("predicts", "forces"),
         create_graph=True,
     )
     potential = mpot.potential.PotentialSeq(pinet, e_readout, f_readout).to(device)
@@ -71,6 +63,7 @@ def main(max_steps: int = 10000):
         model=potential,
         optimizer=optimizer,
         loss_fn=loss_fn,
+        device=device,
     )
     trainer.compile()
     trainer.add_lr_scheduler(scheduler)
